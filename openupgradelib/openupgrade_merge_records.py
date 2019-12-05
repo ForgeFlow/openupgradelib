@@ -190,6 +190,11 @@ def _change_reference_refs_sql(env, model_name, record_ids, target_record_id,
 
 def _change_reference_refs_orm(env, model_name, record_ids, target_record_id,
                                exclude_columns):
+    if env.context.get('skip_reference_refs_orm'):
+        logger.debug(
+            "Ignored record(s) of model '%s'", model_name,
+        )
+        return
     fields = env['ir.model.fields'].search([('ttype', '=', 'reference')])
     if version_info[0] >= 12:
         fields |= env.ref('base.field_ir_property__value_reference')
