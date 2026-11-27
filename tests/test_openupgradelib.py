@@ -244,6 +244,28 @@ class TestOpenupgradelib(unittest.TestCase):
         openupgrade.disable_invalid_filters(self.env)
         self.assertFalse(invalid_filter.active)
 
+    def test_map_values_defaults(self):
+        """The default value is mapped once, not through the whole mapping."""
+        self.env["ir.default"].set("res.partner", "type", "invoice")
+        openupgrade.openupgrade_tools.invalidate_cache(self.env, flush=True)
+        legacy_name = openupgrade.get_legacy_name("type")
+        openupgrade.copy_columns(self.cr, {"res_partner": [("type", None, None)]})
+        openupgrade.map_values(
+            self.cr,
+            legacy_name,
+            "type",
+            [("invoice", "delivery"), ("delivery", "other")],
+            table="res_partner",
+        )
+        self.cr.execute(
+            """
+            SELECT json_value FROM ir_default d
+            JOIN ir_model_fields f ON f.id = d.field_id
+            WHERE f.model = 'res.partner' AND f.name = 'type'
+            """
+        )
+        self.assertEqual(self.cr.fetchall(), [('"delivery"',)])
+
     def test_update_module_names(self):
         old = "dummy_module"
         new = "renamed_module"

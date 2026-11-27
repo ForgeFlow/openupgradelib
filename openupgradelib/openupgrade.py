@@ -2353,6 +2353,42 @@ def float_to_integer(cr, table, field):
     )
 
 
+def _map_default_values(cr, table, field_name, mapping):
+    """Map the default values (ir.default, from 11.0) of the field stored in
+    the column ``field_name`` of ``table``. Each default is mapped once, so
+    that a mapping like [('a', 'b'), ('b', 'c')] does not turn 'a' into 'c'.
+    A default mapped to False is removed."""
+    if not table_exists(cr, "ir_default"):
+        return
+    cr.execute("SELECT id, model FROM ir_model_fields WHERE name = %s", (field_name,))
+    field_ids = tuple(
+        field_id for field_id, model in cr.fetchall() if get_model2table(model) == table
+    )
+    value_mapping = {
+        old: new for old, new in mapping if old is not True and old is not False
+    }
+    if not field_ids or not value_mapping:
+        return
+    cr.execute(
+        "SELECT id, json_value FROM ir_default WHERE field_id IN %s", (field_ids,)
+    )
+    for default_id, json_value in cr.fetchall():
+        try:
+            value = json.loads(json_value)
+        except ValueError:
+            continue
+        if not isinstance(value, (str, int)) or value not in value_mapping:
+            continue
+        new = value_mapping[value]
+        if new is False:
+            cr.execute("DELETE FROM ir_default WHERE id = %s", (default_id,))
+        else:
+            cr.execute(
+                "UPDATE ir_default SET json_value = %s WHERE id = %s",
+                (json.dumps(new, ensure_ascii=False), default_id),
+            )
+
+
 def map_values(
     cr, source_column, target_column, mapping, model=None, table=None, write="sql"
 ):
@@ -2378,6 +2414,8 @@ def map_values(
 
     This method does not support mapping m2m, o2m or property fields. \
     For o2m you can migrate the inverse field's column instead.
+
+    The default values (ir.default) of the target field are mapped too.
 
     .. versionadded:: 8.0
     """
@@ -2444,6 +2482,7 @@ def map_values(
                 [row[0] for row in cr.fetchall()],
                 {target_column: new},
             )
+    _map_default_values(cr, table, target_column, mapping)
 
 
 def message(cr, module, table, column, message, *args, **kwargs):
