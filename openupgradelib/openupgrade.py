@@ -1012,6 +1012,49 @@ def rename_tables(cr, table_spec):
             )
 
 
+# Columns holding a model name, without a record id next to it (those are
+# returned by get_many2one_references). A column is only updated when it
+# exists and is a text column, so tables of modules not installed or columns
+# of other versions are skipped.
+_MODEL_NAME_COLUMNS = [
+    ("base_import_mapping", "res_model"),
+    ("card_campaign", "res_model"),
+    ("email_template", "model"),
+    ("ir_act_client", "res_model"),
+    ("ir_act_report_xml", "model"),
+    ("ir_act_server", "model_name"),
+    ("ir_act_window", "res_model"),
+    ("ir_act_window", "src_model"),
+    ("ir_cron", "model"),
+    ("ir_exports", "resource"),
+    ("ir_filters", "model_id"),
+    ("ir_model_fields_anonymization", "model_name"),
+    ("ir_ui_view", "model"),
+    ("ir_values", "model"),
+    ("mail_activity_type", "res_model"),
+    ("mail_message_subtype", "res_model"),
+    ("mail_template", "model"),
+    ("rating_rating", "parent_res_model"),
+    ("sms_template", "model"),
+]
+
+
+def _get_model_name_columns(cr):
+    """Return the columns of _MODEL_NAME_COLUMNS present in the database."""
+    cr.execute(
+        """
+        SELECT table_name, column_name
+        FROM information_schema.columns
+        WHERE table_schema = current_schema()
+            AND (table_name, column_name) IN %s
+            AND data_type IN ('character varying', 'text')
+        ORDER BY table_name, column_name
+        """,
+        (tuple(_MODEL_NAME_COLUMNS),),
+    )
+    return cr.fetchall()
+
+
 def rename_models(cr, model_spec):
     """
     Rename models. Typically called in the pre script.
@@ -1025,6 +1068,7 @@ def rename_models(cr, model_spec):
     you need to call `rename_tables` method.
     """
     many2one_references = get_many2one_references(cr)
+    model_name_columns = _get_model_name_columns(cr)
     for (old, new) in model_spec:
         logger.info("model %s: renaming to %s", old, new)
         _old = old.replace(".", "_")
@@ -1089,14 +1133,6 @@ def rename_models(cr, model_spec):
                 "WHERE name LIKE %s",
                 (new, old + ",%"),
             )
-        logged_query(
-            cr,
-            "UPDATE ir_filters SET model_id = %s WHERE model_id = %s",
-            (
-                new,
-                old,
-            ),
-        )
         logged_query(
             cr,
             "SELECT id FROM ir_model_fields "
@@ -1175,57 +1211,14 @@ def rename_models(cr, model_spec):
                 },
                 skip_no_result=True,
             )
-        # Update export profiles references
-        logged_query(
-            cr,
-            "UPDATE ir_exports SET resource = %s WHERE resource = %s",
-            (new, old),
-        )
-        if column_exists(cr, "ir_act_server", "model_name"):
-            # model_name is a related field that in v11 becomes stored
+        for table, column in model_name_columns:
             logged_query(
                 cr,
-                "UPDATE ir_act_server SET model_name = %s WHERE model_name = %s",
-                (
-                    new,
-                    old,
+                sql.SQL("UPDATE {table} SET {column} = %s WHERE {column} = %s").format(
+                    table=sql.Identifier(table), column=sql.Identifier(column)
                 ),
-            )
-        if is_module_installed(cr, "email_template"):
-            if table_exists(cr, "email_template") and column_exists(
-                cr, "email_template", "model"
-            ):
-                logged_query(
-                    cr,
-                    "UPDATE email_template SET model=%s where model=%s",
-                    (new, old),
-                )
-        if is_module_installed(cr, "mail"):
-            # fortunately, the data model didn't change up to now
-            if table_exists(cr, "mail_message_subtype"):
-                logged_query(
-                    cr,
-                    "UPDATE mail_message_subtype SET res_model=%s "
-                    "where res_model=%s",
-                    (new, old),
-                )
-            if table_exists(cr, "mail_template"):
-                logged_query(
-                    cr,
-                    "UPDATE mail_template SET model=%s where model=%s",
-                    (new, old),
-                )
-        if column_exists(cr, "rating_rating", "parent_res_model"):
-            logged_query(
-                cr,
-                "UPDATE rating_rating SET parent_res_model=%s where parent_res_model=%s",
                 (new, old),
-            )
-        if is_module_installed(cr, "marketing_card"):
-            logged_query(
-                cr,
-                "UPDATE card_campaign SET res_model=%s where res_model=%s",
-                (new, old),
+                skip_no_result=True,
             )
 
     # TODO: signal where the model occurs in references to ir_model

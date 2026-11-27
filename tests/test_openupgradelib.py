@@ -303,6 +303,38 @@ class TestOpenupgradelib(unittest.TestCase):
         )
         return "openupgradelib_tests.%s" % name
 
+    def test_rename_models(self):
+        """Actions, views and filters pointing to a renamed model follow it."""
+        ir_filter = self.env["ir.filters"].create(
+            {"name": "test filter", "model_id": "res.users"}
+        )
+        references = (
+            ("ir_act_window", "res_model", self.env.ref("base.action_res_users").id),
+            ("ir_ui_view", "model", self.env.ref("base.view_users_form").id),
+            ("ir_filters", "model_id", ir_filter.id),
+        )
+        query_sql = psycopg2.sql.SQL
+        for table, column, record_id in references:
+            self.cr.execute(
+                query_sql(
+                    "UPDATE {} SET {} = 'openupgradelib.old' WHERE id = %s"
+                ).format(
+                    psycopg2.sql.Identifier(table), psycopg2.sql.Identifier(column)
+                ),
+                (record_id,),
+            )
+        openupgrade.rename_models(
+            self.cr, [("openupgradelib.old", "openupgradelib.new")]
+        )
+        for table, column, record_id in references:
+            self.cr.execute(
+                query_sql("SELECT {} FROM {} WHERE id = %s").format(
+                    psycopg2.sql.Identifier(column), psycopg2.sql.Identifier(table)
+                ),
+                (record_id,),
+            )
+            self.assertEqual(self.cr.fetchone()[0], "openupgradelib.new")
+
     def test_add_inherits_parent_xmlids(self):
         """The missing XML ID of the partner of a user is added, but not when
         the partner already has one of its own, like the one of the admin."""
