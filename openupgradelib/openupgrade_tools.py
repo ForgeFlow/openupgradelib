@@ -21,10 +21,18 @@
 
 # A collection of functions split off from openupgrade.py
 # with no or only minimal dependencies
+import ast
 import logging
+import sys
+import tokenize
 
 from lxml.etree import tostring
 from lxml.html import fromstring
+
+if sys.version_info[0] < 3:
+    from StringIO import StringIO
+else:
+    from io import StringIO
 
 logger = logging.getLogger(__name__)
 
@@ -407,3 +415,108 @@ def not_html_empty_where_clause(column):
     )""".format(
         column=column
     )
+
+
+def _replace_literal_strings(text, get_new_value):
+    """Replace string literals in the Python expression ``text``.
+
+    Only the content of the literals changes: quotes, prefixes and the rest of
+    the expression keep their original form.
+
+    :param text: Python expression, such as the domain of a filter.
+    :param get_new_value: function receiving the value of the literal, the
+      opening brackets enclosing it (from the outermost one), and the tokens
+      before and after it. It returns the new value, or None to keep it.
+    :return: the expression with the literals replaced, or ``text`` itself
+      when it is not a valid Python expression.
+    """
+    try:
+        tokens = list(tokenize.generate_tokens(StringIO(text).readline))
+    except (tokenize.TokenError, SyntaxError):
+        return text
+    significant = [
+        token
+        for token in tokens
+        if token[0] not in (tokenize.NL, tokenize.NEWLINE, tokenize.COMMENT)
+    ]
+    replacements = []
+    brackets = []
+    for index, token in enumerate(significant):
+        token_type, token_string, start, end = token[:4]
+        if token_type == tokenize.OP and token_string in "([{":
+            brackets.append(token_string)
+        elif token_type == tokenize.OP and token_string in ")]}":
+            if brackets:
+                brackets.pop()
+        elif token_type == tokenize.STRING:
+            try:
+                value = ast.literal_eval(token_string)
+            except (ValueError, SyntaxError):
+                continue
+            previous = significant[index - 1][1] if index else None
+            following = (
+                significant[index + 1][1] if index + 1 < len(significant) else None
+            )
+            new_value = get_new_value(value, tuple(brackets), previous, following)
+            if new_value is None or new_value == value:
+                continue
+            quote_start = min(
+                position
+                for position in (token_string.find("'"), token_string.find('"'))
+                if position >= 0
+            )
+            quote = token_string[quote_start]
+            if token_string[quote_start : quote_start + 3] == quote * 3:
+                quote *= 3
+            replacements.append(
+                (start, end, token_string[:quote_start] + quote + new_value + quote)
+            )
+    if not replacements:
+        return text
+    line_offsets = [0]
+    for line in text.splitlines(True):
+        line_offsets.append(line_offsets[-1] + len(line))
+    result = text
+    for start, end, new_string in reversed(replacements):
+        start_offset = line_offsets[start[0] - 1] + start[1]
+        end_offset = line_offsets[end[0] - 1] + end[1]
+        result = result[:start_offset] + new_string + result[end_offset:]
+    return result
+
+
+def _rename_domain_field(domain, old_field, new_field):
+    """Rename a field in the leaves of a domain written as text.
+
+    Only the field of each leaf (its first element) is renamed, also when it is
+    the first step of a path (``old_field.name``). Values, operators and the
+    leaves of nested domains (``any`` operator, which apply to another model)
+    are kept.
+    """
+
+    def get_new_value(value, brackets, previous, following):
+        if (
+            len(brackets) == 2
+            and previous in ("(", "[")
+            and following == ","
+            and (value == old_field or value.startswith(old_field + "."))
+        ):
+            return new_field + value[len(old_field) :]
+        return None
+
+    return _replace_literal_strings(domain, get_new_value)
+
+
+def _rename_dict_key(dict_string, old_key, new_key):
+    """Rename a key of a dictionary written as text, keeping its values."""
+
+    def get_new_value(value, brackets, previous, following):
+        if (
+            brackets == ("{",)
+            and previous in ("{", ",")
+            and following == ":"
+            and value == old_key
+        ):
+            return new_key
+        return None
+
+    return _replace_literal_strings(dict_string, get_new_value)

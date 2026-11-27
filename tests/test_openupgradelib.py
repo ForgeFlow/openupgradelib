@@ -102,6 +102,11 @@ class TestOpenupgradelib(unittest.TestCase):
             {
                 "name": "test filter 2",
                 "model_id": "ir.module.module",
+                "domain": (
+                    '["|", ("name", "=", "name"), '
+                    "('shortdesc', 'in', ['name', 'start_date']), "
+                    "('name_2', '=', 'start_date')]"
+                ),
                 "context": (
                     '{"group_by": ["start_date:quarter", "start_date_2"], '
                     "'pivot_row_groupby': ['start_date:iso_week_number'], "
@@ -132,6 +137,42 @@ class TestOpenupgradelib(unittest.TestCase):
                 "'pivot_row_groupby': ['date_start:iso_week_number'], "
                 "'graph_measure':'renamed_name'}"
             ),
+        )
+        self.assertEqual(
+            test_filter_2.domain,
+            (
+                '["|", ("renamed_name", "=", "name"), '
+                "('shortdesc', 'in', ['name', 'start_date']), "
+                "('name_2', '=', 'start_date')]"
+            ),
+        )
+
+    def test_rename_domain_field(self):
+        rename = openupgradelib.openupgrade_tools._rename_domain_field
+        self.assertEqual(
+            rename(
+                "[('state', '=', 'done'), ('done.id', '=', 1),\n"
+                " ('partner_id', 'any', [('done', '=', True)]), (u'done', '=', 1)]",
+                "done",
+                "is_done",
+            ),
+            "[('state', '=', 'done'), ('is_done.id', '=', 1),\n"
+            " ('partner_id', 'any', [('done', '=', True)]), (u'is_done', '=', 1)]",
+        )
+        self.assertEqual(
+            rename("[('done', '=', 'é'), ('done', '=', 1)]", "done", "is_done"),
+            "[('is_done', '=', 'é'), ('is_done', '=', 1)]",
+        )
+        self.assertEqual(rename("[('done', '=',", "done", "is_done"), "[('done', '=',")
+
+    def test_rename_dict_key(self):
+        self.assertEqual(
+            openupgradelib.openupgrade_tools._rename_dict_key(
+                "{'type': 'done', \"done\": True, 'other': {'done': 1}}",
+                "done",
+                "is_done",
+            ),
+            "{'type': 'done', \"is_done\": True, 'other': {'done': 1}}",
         )
 
     def test_lift_constraints(self):

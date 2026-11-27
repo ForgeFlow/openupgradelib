@@ -860,20 +860,18 @@ def rename_field_references(env, field_spec):
         # Example of replaced domain: [['field', '=', self], ...]
         # TODO: Rename when the field is part of a submodel (ex. m2one.field)
         cr.execute(
-            """
-            UPDATE ir_filters
-            SET domain = regexp_replace(
-                domain, %(old_pattern)s, %(new_pattern)s, 'g'
-            )
-            WHERE model_id = %%s
-                AND domain ~ %(old_pattern)s
-            """
-            % {
-                "old_pattern": r"""$$('|")%s('|")$$""" % old_field,
-                "new_pattern": r"$$\1%s\2$$" % new_field,
-            },
-            (model,),
+            "SELECT id, domain FROM ir_filters WHERE model_id = %s AND domain ~ %s",
+            (model, r"""['"]%s['".]""" % old_field),
         )
+        for filter_id, domain in cr.fetchall():
+            new_domain = openupgrade_tools._rename_domain_field(
+                domain, old_field, new_field
+            )
+            if new_domain != domain:
+                cr.execute(
+                    "UPDATE ir_filters SET domain = %s WHERE id = %s",
+                    (new_domain, filter_id),
+                )
         # Examples of replaced contexts:
         # {'group_by': ['field', 'other_field'], 'other_key':value}
         # {'group_by': ['date_field:month']}
@@ -927,20 +925,22 @@ def rename_field_references(env, field_spec):
             # Rename appearances on mail alias
             cr.execute(
                 """
-                UPDATE mail_alias ma
-                SET alias_defaults =
-                    replace(alias_defaults, %(old_pattern)s, %(new_pattern)s)
-                FROM ir_model im
-                WHERE ma.alias_model_id = im.id
-                    AND im.model = %%s
-                    AND ma.alias_defaults ~ %(old_pattern)s
-                """
-                % {
-                    "old_pattern": "$$'%s'$$" % old_field,
-                    "new_pattern": "$$'%s'$$" % new_field,
-                },
-                (model,),
+                SELECT ma.id, ma.alias_defaults
+                FROM mail_alias ma
+                JOIN ir_model im ON ma.alias_model_id = im.id
+                WHERE im.model = %s AND ma.alias_defaults ~ %s
+                """,
+                (model, r"""['"]%s['"]""" % old_field),
             )
+            for alias_id, alias_defaults in cr.fetchall():
+                new_alias_defaults = openupgrade_tools._rename_dict_key(
+                    alias_defaults, old_field, new_field
+                )
+                if new_alias_defaults != alias_defaults:
+                    cr.execute(
+                        "UPDATE mail_alias SET alias_defaults = %s WHERE id = %s",
+                        (new_alias_defaults, alias_id),
+                    )
 
 
 def rename_tables(cr, table_spec):
