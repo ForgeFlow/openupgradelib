@@ -85,6 +85,88 @@ class TestOpenupgradelib(unittest.TestCase):
             chunked_records += chunk
         self.assertEqual(records, chunked_records)
 
+    def test_explode_query(self):
+        with self.assertRaises(ValueError):
+            openupgrade.explode_query(self.cr, "SELECT 1", "res_partner")
+        queries = openupgrade.explode_query(
+            self.cr,
+            "SELECT p.id FROM res_partner p WHERE {parallel_filter}",
+            "res_partner",
+            alias="p",
+            bucket_size=2,
+        )
+        ids = []
+        for query in queries:
+            self.assertIn('"p".id BETWEEN', query)
+            self.cr.execute(query)
+            ids += [row[0] for row in self.cr.fetchall()]
+        self.assertEqual(
+            sorted(ids),
+            sorted(
+                self.env["res.partner"].with_context(active_test=False).search([]).ids
+            ),
+        )
+
+    def test_explode_execute(self):
+        partner_count = (
+            self.env["res.partner"].with_context(active_test=False).search_count([])
+        )
+        rowcount = openupgrade.explode_execute(
+            self.cr,
+            "UPDATE res_partner SET comment = %s WHERE {parallel_filter}",
+            "res_partner",
+            bucket_size=2,
+            args=("exploded",),
+        )
+        self.assertEqual(rowcount, partner_count)
+        self.cr.execute("SELECT count(*) FROM res_partner WHERE comment = 'exploded'")
+        self.assertEqual(self.cr.fetchone()[0], partner_count)
+
+    def test_explode_execute_parallel(self):
+        """The parallel execution commits: work on a table of the test only."""
+        self.cr.execute(
+            "CREATE TABLE openupgradelib_test_explode AS "
+            "SELECT generate_series(1, 100) AS id, 0 AS value"
+        )
+        # the connections of the parallel execution must see the table
+        self.cr.commit()  # pylint: disable=invalid-commit
+        try:
+            rowcount = openupgrade.explode_execute(
+                self.cr,
+                "UPDATE openupgradelib_test_explode SET value = id "
+                "WHERE {parallel_filter}",
+                "openupgradelib_test_explode",
+                bucket_size=10,
+                parallel=True,
+                max_workers=4,
+            )
+            self.assertEqual(rowcount, 100)
+            self.cr.execute(
+                "SELECT count(*) FROM openupgradelib_test_explode WHERE value = id"
+            )
+            self.assertEqual(self.cr.fetchone()[0], 100)
+        finally:
+            self.cr.rollback()
+            self.cr.execute("DROP TABLE openupgradelib_test_explode")
+            # the table was committed: drop it for good
+            self.cr.commit()  # pylint: disable=invalid-commit
+
+    def test_recompute_fields(self):
+        partner = self.env["res.partner"].create({"name": "Test recompute"})
+        openupgrade.openupgrade_tools.invalidate_cache(self.env, flush=True)
+        self.cr.execute(
+            "UPDATE res_partner SET commercial_partner_id = NULL WHERE id = %s",
+            (partner.id,),
+        )
+        openupgrade.recompute_fields(
+            self.env, "res.partner", ["commercial_partner_id"], ids=partner.ids
+        )
+        self.cr.execute(
+            "SELECT commercial_partner_id FROM res_partner WHERE id = %s",
+            (partner.id,),
+        )
+        self.assertEqual(self.cr.fetchone()[0], partner.id)
+
     def test_rename_field_references(self):
         test_filter = self.env["ir.filters"].create(
             {

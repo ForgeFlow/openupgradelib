@@ -22,9 +22,14 @@ except ImportError:
 from contextlib import contextmanager
 
 try:
-    from psycopg2 import IntegrityError, ProgrammingError, errorcodes
+    from psycopg2 import IntegrityError, OperationalError, ProgrammingError, errorcodes
 except ImportError:
-    from psycopg2cffi import IntegrityError, ProgrammingError, errorcodes
+    from psycopg2cffi import (
+        IntegrityError,
+        OperationalError,
+        ProgrammingError,
+        errorcodes,
+    )
 try:
     from contextlib import ExitStack
 except ImportError:
@@ -225,6 +230,9 @@ __all__ = [
     "cow_templates_mark_if_equal_to_upstream",
     "cow_templates_replicate_upstream",
     "clean_transient_models",
+    "explode_query",
+    "explode_execute",
+    "recompute_fields",
 ]
 
 
@@ -3871,6 +3879,137 @@ def chunked(records, single=True):
                 yield record
             continue
         yield chunk
+
+
+def explode_query(cr, query, table, alias=None, bucket_size=10000):
+    """Split a query in several queries, each one on a range of ids of a table.
+
+    :param query: the query, with a ``{parallel_filter}`` placeholder where the
+      condition on the ids goes, for instance
+      ``UPDATE account_move_line SET x = y WHERE {parallel_filter}``.
+    :param table: the table whose ids are split in ranges.
+    :param alias: the alias of the table in the query, if it has one.
+    :param bucket_size: the number of ids of each range.
+    :return: the list of queries, empty when the table has no rows.
+    """
+    if "{parallel_filter}" not in query:
+        raise ValueError("The query has no {parallel_filter} placeholder")
+    cr.execute(sql.SQL("SELECT min(id), max(id) FROM {}").format(sql.Identifier(table)))
+    min_id, max_id = cr.fetchone()
+    if min_id is None:
+        return []
+    queries = []
+    for lower_id in range(min_id, max_id + 1, bucket_size):
+        parallel_filter = sql.SQL("{}.id BETWEEN {} AND {}").format(
+            sql.Identifier(alias or table),
+            sql.Literal(lower_id),
+            sql.Literal(lower_id + bucket_size - 1),
+        )
+        queries.append(
+            query.replace("{parallel_filter}", parallel_filter.as_string(cr._obj))
+        )
+    return queries
+
+
+def explode_execute(
+    cr,
+    query,
+    table,
+    alias=None,
+    bucket_size=10000,
+    args=None,
+    parallel=False,
+    max_workers=None,
+):
+    """Execute a query by ranges of ids of a table, see ``explode_query``.
+
+    Splitting a query on a big table keeps each statement short and lets the
+    progress be logged. With ``parallel``, the ranges are executed at the same
+    time in several connections.
+
+    :param args: the arguments of the query, passed to every execution.
+    :param parallel: execute the queries in parallel, each one in its own
+      connection and transaction. WARNING: the cursor is committed first, so
+      that the other connections see the changes made so far, and each query
+      is committed when it ends: a later error does not undo them. Queries
+      failing on a deadlock or a serialization error are executed again one
+      by one in the cursor, which is committed again at the end. Needs
+      Python 3.
+    :param max_workers: the maximum number of connections used in parallel,
+      the number of CPUs by default.
+    :return: the number of rows affected.
+    """
+    queries = explode_query(cr, query, table, alias=alias, bucket_size=bucket_size)
+    if not parallel or len(queries) < 2:
+        rowcount = 0
+        for index, exploded_query in enumerate(queries, 1):
+            cr.execute(exploded_query, args)
+            rowcount += cr.rowcount
+            logger.debug("%s: %s/%s queries executed", table, index, len(queries))
+        return rowcount
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    db_connect = core.sql_db.db_connect
+
+    def execute(exploded_query):
+        with db_connect(cr.dbname).cursor() as thread_cr:
+            thread_cr.execute(exploded_query, args)
+            return thread_cr.rowcount
+
+    # the other connections only see the changes of this cursor once committed
+    cr.commit()  # pylint: disable=invalid-commit
+    rowcount = 0
+    failed_queries = []
+    workers = min(len(queries), max_workers or os.cpu_count() or 1)
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {executor.submit(execute, q): q for q in queries}
+        for index, future in enumerate(as_completed(futures), 1):
+            try:
+                rowcount += future.result()
+            except OperationalError as error:
+                if error.pgcode not in (
+                    errorcodes.DEADLOCK_DETECTED,
+                    errorcodes.SERIALIZATION_FAILURE,
+                ):
+                    raise
+                failed_queries.append(futures[future])
+            logger.debug("%s: %s/%s queries executed", table, index, len(queries))
+    if failed_queries:
+        logger.warning(
+            "%s: executing again one by one %s queries failed on concurrency",
+            table,
+            len(failed_queries),
+        )
+        for failed_query in failed_queries:
+            cr.execute(failed_query, args)
+            rowcount += cr.rowcount
+    # committed like the queries executed in parallel, and so that a snapshot
+    # taken by the cursor meanwhile (repeatable read) sees their changes
+    cr.commit()  # pylint: disable=invalid-commit
+    return rowcount
+
+
+def recompute_fields(env, model, fields, ids=None):
+    """Recompute stored computed fields by chunks of records, to keep the
+    memory used low, for instance after changing their dependencies in SQL.
+
+    :param model: the model name.
+    :param fields: the names of the fields to recompute.
+    :param ids: the ids of the records to recompute, all records (archived
+      included) by default.
+    """
+    Model = env[model].with_context(active_test=False)
+    records = Model.browse(ids) if ids is not None else Model.search([])
+    model_fields = [records._fields[name] for name in fields]
+    for chunk in chunked(records, single=False):
+        for field in model_fields:
+            if version_info[0] >= 13:
+                env.add_to_compute(field, chunk)
+            else:
+                env.add_todo(field, chunk)
+        if version_info[0] < 13:
+            chunk.recompute()
+    openupgrade_tools.invalidate_cache(env, flush=True)
 
 
 def set_xml_ids_noupdate_value(env, module, xml_ids, value):
