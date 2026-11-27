@@ -742,7 +742,28 @@ def rename_columns(cr, column_spec):
                 )
 
 
-def rename_fields(env, field_spec, no_deep=False):
+def _get_inheriting_models(cr, model):
+    """Return the models inheriting directly from ``model``, through
+    ``_inherit`` with another ``_name`` or through ``_inherits``, as reflected
+    in ir_model_inherit. This table exists from 17.0: before, no model is
+    returned."""
+    if not table_exists(cr, "ir_model_inherit"):
+        return []
+    cr.execute(
+        """
+        SELECT DISTINCT child.model
+        FROM ir_model_inherit imi
+        JOIN ir_model parent ON parent.id = imi.parent_id
+        JOIN ir_model child ON child.id = imi.model_id
+        WHERE parent.model = %s
+        ORDER BY child.model
+        """,
+        (model,),
+    )
+    return [row[0] for row in cr.fetchall()]
+
+
+def rename_fields(env, field_spec, no_deep=False, skip_inherit=()):
     """Rename fields. Typically called in the pre script. WARNING: If using
     this on base module, pass the argument ``no_deep`` with True value for
     avoiding the using of the environment (which is not yet loaded).
@@ -758,6 +779,13 @@ def rename_fields(env, field_spec, no_deep=False):
     This method performs also the SQL column renaming, so only one call is
     needed.
 
+    From 17.0, the field is also renamed in the models inheriting from the
+    model, directly or not: the ones using ``_inherit`` with another
+    ``_name`` (their own column) and the ones using ``_inherits`` (the
+    delegated field and its references), as found in ``ir_model_inherit``.
+    In 17.0, this table misses the models declaring ``_inherits`` through a
+    ``delegate=True`` field (ir.cron): rename the field in them explicitly.
+
     :param env: Environment/pool variable. The database cursor is the only
       thing needed, but added in prevision of TODO tasks for not breaking
       API later.
@@ -768,6 +796,10 @@ def rename_fields(env, field_spec, no_deep=False):
       * New field name. The name of the new field.
     :param no_deep: If True, avoids to perform any operation that involves
       the environment. Not used for now.
+    :param skip_inherit: names of the inheriting models (and of the models
+      inheriting from them) where the field must not be renamed, for instance
+      because they define their own field with the old name. Pass ``"*"`` to
+      rename the field only in the given models.
     """
     cr = env.cr
     for model, table, old_field, new_field in field_spec:
@@ -822,6 +854,21 @@ def rename_fields(env, field_spec, no_deep=False):
                 (new_field, model, old_field),
             )
         rename_field_references(env, [(model, old_field, new_field)])
+        if skip_inherit == "*":
+            continue
+        for child in _get_inheriting_models(cr, model):
+            if child in skip_inherit:
+                continue
+            if not no_deep and child in env.registry:
+                child_table = env.registry[child]._table
+            else:
+                child_table = get_model2table(child)
+            rename_fields(
+                env,
+                [(child, child_table, old_field, new_field)],
+                no_deep=no_deep,
+                skip_inherit=skip_inherit,
+            )
 
 
 def rename_field_references(env, field_spec):

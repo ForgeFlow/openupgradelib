@@ -330,6 +330,59 @@ class TestOpenupgradelib(unittest.TestCase):
             [],
         )
 
+    def _get_field_models(self, field_name, models):
+        self.cr.execute(
+            "SELECT model FROM ir_model_fields WHERE name = %s AND model IN %s",
+            (field_name, tuple(models)),
+        )
+        return {row[0] for row in self.cr.fetchall()}
+
+    def test_rename_fields_inherit(self):
+        """The field is renamed in the models inheriting from the model through
+        _inherit (ir.actions.server) and their children."""
+        if openupgrade.version_info[0] < 17:
+            self.skipTest("ir_model_inherit exists from 17.0")
+        models = ("ir.actions.actions", "ir.actions.server")
+        ir_filter = self.env["ir.filters"].create(
+            {
+                "name": "test",
+                "model_id": "ir.actions.server",
+                "domain": "[('help', '=', 'x')]",
+            }
+        )
+        openupgrade.rename_fields(
+            self.env, [("ir.actions.actions", "ir_actions", "help", "help_renamed")]
+        )
+        self.assertEqual(self._get_field_models("help_renamed", models), set(models))
+        self.assertFalse(self._get_field_models("help", models))
+        self.assertTrue(
+            openupgrade.column_exists(self.cr, "ir_act_server", "help_renamed")
+        )
+        openupgrade.openupgrade_tools.invalidate_cache(self.env, flush=True)
+        self.assertEqual(ir_filter.domain, "[('help_renamed', '=', 'x')]")
+
+    def test_rename_fields_inherits(self):
+        """The delegated field of a model using _inherits is renamed."""
+        if openupgrade.version_info[0] < 17:
+            self.skipTest("ir_model_inherit exists from 17.0")
+        models = ("res.partner", "res.users")
+        openupgrade.rename_fields(
+            self.env, [("res.partner", "res_partner", "comment", "comment_renamed")]
+        )
+        self.assertEqual(self._get_field_models("comment_renamed", models), set(models))
+        self.assertFalse(self._get_field_models("comment", models))
+
+    def test_rename_fields_skip_inherit(self):
+        if openupgrade.version_info[0] < 17:
+            self.skipTest("ir_model_inherit exists from 17.0")
+        models = ("ir.actions.actions", "ir.actions.server", "ir.actions.report")
+        openupgrade.rename_fields(
+            self.env,
+            [("ir.actions.actions", "ir_actions", "help", "help_renamed")],
+            skip_inherit=["ir.actions.server"],
+        )
+        self.assertEqual(self._get_field_models("help", models), {"ir.actions.server"})
+
     def test_delete_records_safely_by_xml_id(self):
         partner = self.env["res.partner"].create({"name": "Test partner"})
         child = self.env["res.partner"].create(
